@@ -1,0 +1,68 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum PaymentMethod {
+  CARD
+  PSE
+  CASH_ON_DELIVERY
+}
+
+enum PaymentStatus {
+  AUTHORIZED
+  DECLINED
+  REFUNDED
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  orderId   String        @map("order_id")
+  buyerId   String        @map("buyer_id")
+  amount    Int
+  method    PaymentMethod
+  status    PaymentStatus
+  reason    String?
+  cardLast4 String?       @map("card_last4")
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  @@index([orderId])
+  @@index([buyerId])
+  @@map("payments")
+}
+
+enum SettlementStatus {
+  PENDING
+  AVAILABLE
+  PAID
+  CANCELLED
+}
+
+model Settlement {
+  id         String           @id @default(uuid())
+  producerId String           @map("producer_id")
+  orderId    String           @map("order_id")
+  gross      Int
+  commission Int
+  net        Int
+  status     SettlementStatus @default(PENDING)
+  createdAt  DateTime         @default(now()) @map("created_at")
+  paidAt     DateTime?        @map("paid_at")
+
+  @@index([producerId])
+  @@index([orderId])
+  @@map("settlements")
+}
+
+model ProcessedEvent {
+  eventId     String   @id @map("event_id")
+  eventType   String   @map("event_type")
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@map("processed_events")
+}

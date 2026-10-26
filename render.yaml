@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: farmtotable-payment-service
+    runtime: docker
+    region: virginia
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: SERVICE_NAME
+        value: payment-service
+      - key: DATABASE_URL
+        sync: false
+      - key: RABBITMQ_URL
+        sync: false
+      - key: INTERNAL_TOKEN
+        sync: false
+      - key: COMMISSION_RATE
+        sync: false
+      - key: MAX_AUTHORIZED_AMOUNT
+        sync: false
+      - key: PRODUCER_SERVICE_URL
+        sync: false
+      - key: ORDER_SERVICE_URL
+        sync: false
