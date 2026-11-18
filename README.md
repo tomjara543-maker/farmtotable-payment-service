@@ -15,6 +15,7 @@ El API Gateway valida el JWT y reenvía `x-user-id` / `x-user-role`; usa `requir
 
 | Método | Ruta | Acceso | Descripción |
 |---|---|---|---|
+| `GET` | `/payments/wompi/config` | BUYER | `{ enabled, baseUrl, publicKey, acceptancePermalink }` para tokenizar la tarjeta en el navegador |
 | `POST` | `/payments` | BUYER dueño | `{ orderId, method: CARD / PSE / CASH_ON_DELIVERY, cardLast4? }` → 201 AUTHORIZED o **402** `{ error, payment }` DECLINED. Solo pedidos CONFIRMED. Monto > MAX_AUTHORIZED_AMOUNT o tarjeta terminada en 0002 se rechaza |
 | `GET` | `/payments/mine` | BUYER | Pagos del comprador |
 | `GET` | `/payments` | ADMIN | Todos |
@@ -22,6 +23,22 @@ El API Gateway valida el JWT y reenvía `x-user-id` / `x-user-role`; usa `requir
 | `POST` | `/payments/settlements/:id/pay` | ADMIN | AVAILABLE → PAID |
 
 Errores: `{ "error": "mensaje" }` con 400 (validación zod), 401, 403, 404, 409 (estado inválido) o 422 (regla de negocio).
+
+## Pasarela de pagos (Wompi, modo sandbox)
+
+Los pagos con tarjeta se procesan con la API de pruebas de [Wompi](https://docs.wompi.co) cuando están definidas `WOMPI_PUBLIC_KEY`, `WOMPI_PRIVATE_KEY` y `WOMPI_INTEGRITY_SECRET` (llaves `pub_test_`, `prv_test_` y `test_integrity_`). Sin ellas, el servicio usa la pasarela simulada (`decide`), que es la que usan las pruebas automáticas. PSE y contra entrega siguen simulados.
+
+Flujo de una tarjeta:
+
+1. El navegador pide `GET /payments/wompi/config` y muestra los términos de Wompi.
+2. El navegador envía los datos de la tarjeta **directo a Wompi** (`POST /tokens/cards` con la llave pública) y recibe un token de un solo uso. La tarjeta nunca pasa por nuestros servidores.
+3. El navegador llama a `POST /payments` con `orderId`, `method: "CARD"`, `cardToken`, `cardLast4`, `customerEmail` y `acceptTerms: true`.
+4. El servicio obtiene los tokens de aceptación (`GET /merchants/info`), crea la transacción (`POST /transactions`, llave privada, firma de integridad SHA-256 de `referencia + centavos + moneda + secreto`) y consulta `GET /transactions/:id` hasta que deja de estar `PENDING`.
+5. `APPROVED` crea el pago `AUTHORIZED`, las liquidaciones y publica `payment.authorized`. `DECLINED`, `VOIDED` o `ERROR` responde 402 y publica `payment.declined`. Si sigue `PENDING` tras unos 30 s responde 504 sin registrar el pago.
+
+Tarjetas de prueba: `4242 4242 4242 4242` (aprobada) y `4111 1111 1111 1111` (rechazada), con cualquier fecha futura y un CVC de 3 dígitos. Cada pago guarda `provider` y `providerRef` (el id de la transacción en Wompi).
+
+Limitaciones conocidas: el reembolso por cancelación se registra solo en este servicio (no anula la transacción en Wompi) y la confirmación no usa el webhook `transaction.updated`.
 
 ## Eventos
 

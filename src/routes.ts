@@ -5,6 +5,7 @@ import { prisma } from "./db";
 import { publish } from "./events";
 import { Payment, Settlement } from "./generated/prisma/client";
 import { callService, HttpError, notFound, round2 } from "./http";
+import { acceptanceTokens, awaitFinalStatus, createCardTransaction, wompiConfig, wompiEnabled } from "./wompi";
 
 const ORDER_URL = process.env.ORDER_SERVICE_URL;
 const PRODUCER_URL = process.env.PRODUCER_SERVICE_URL;
@@ -28,8 +29,14 @@ const paySchema = z
     orderId: z.string().min(1, "El campo orderId es obligatorio"),
     method: z.enum(["CARD", "PSE", "CASH_ON_DELIVERY"], "Método de pago inválido"),
     cardLast4: z.string().optional(),
+    cardToken: z.string().min(1).optional(),
+    customerEmail: z.string().email("Correo inválido").optional(),
+    acceptTerms: z.boolean().optional(),
   })
-  .refine((p) => p.method !== "CARD" || /^\d{4}$/.test(p.cardLast4 ?? ""), "Tarjeta inválida");
+  .refine((p) => p.method !== "CARD" || /^\d{4}$/.test(p.cardLast4 ?? ""), "Tarjeta inválida")
+  .refine((p) => !(wompiEnabled() && p.method === "CARD") || Boolean(p.cardToken), "Falta el token de la tarjeta")
+  .refine((p) => !(wompiEnabled() && p.method === "CARD") || Boolean(p.customerEmail), "Falta el correo del comprador")
+  .refine((p) => !(wompiEnabled() && p.method === "CARD") || p.acceptTerms === true, "Debes aceptar los términos de la pasarela");
 
 export const paymentJson = (p: Payment) => ({
   id: p.id,
@@ -40,6 +47,7 @@ export const paymentJson = (p: Payment) => ({
   status: p.status,
   reason: p.reason ?? undefined,
   cardLast4: p.cardLast4 ?? undefined,
+  provider: p.provider ?? undefined,
   createdAt: p.createdAt,
 });
 
@@ -75,8 +83,21 @@ export function settlementsFor(items: Pick<Order["items"][number], "producerId" 
 export function paymentRoutes() {
   const router = Router();
 
+  router.get("/wompi/config", requireUser("BUYER"), async (_req, res) => {
+    if (!wompiEnabled()) return res.json({ enabled: false });
+    const { baseUrl, publicKey } = wompiConfig();
+    const tokens = await acceptanceTokens().catch(() => undefined);
+    res.json({
+      enabled: true,
+      baseUrl,
+      publicKey,
+      acceptancePermalink: tokens?.acceptancePermalink,
+      personalAuthPermalink: tokens?.personalAuthPermalink,
+    });
+  });
+
   router.post("/", requireUser("BUYER"), async (req, res) => {
-    const { orderId, method, cardLast4 } = paySchema.parse(req.body);
+    const { orderId, method, cardLast4, cardToken, customerEmail } = paySchema.parse(req.body);
     const user = userOf(res);
     const order = await callService<Order>(ORDER_URL, `/orders/${encodeURIComponent(orderId)}`, { user });
     if (order.buyerId !== user.id) throw notFound("Pedido");
@@ -85,20 +106,49 @@ export function paymentRoutes() {
       throw new HttpError(409, "Este pedido ya fue pagado");
     }
 
-    const reason = decide(order, method, cardLast4);
     const last4 = method === "CARD" ? cardLast4 : undefined;
+    const viaWompi = method === "CARD" && wompiEnabled();
 
-    if (reason) {
+    const decline = async (reason: string, provider?: string, providerRef?: string) => {
       const payment = await prisma.payment.create({
-        data: { orderId, buyerId: user.id, amount: order.total, method, status: "DECLINED", reason, cardLast4: last4 },
+        data: { orderId, buyerId: user.id, amount: order.total, method, status: "DECLINED", reason, cardLast4: last4, provider, providerRef },
       });
       publish("payment.declined", { paymentId: payment.id, orderId, buyerId: user.id, reason });
       return res.status(402).json({ error: reason, payment: paymentJson(payment) });
+    };
+
+    let provider: string | undefined;
+    let providerRef: string | undefined;
+
+    if (viaWompi) {
+      if (order.total > MAX_AUTHORIZED_AMOUNT) return decline("El monto supera el límite autorizado por la pasarela");
+      const reference = `ftt-${order.id}-${Date.now()}`;
+      const tokens = await acceptanceTokens();
+      const created = await createCardTransaction({
+        cardToken: cardToken!,
+        amountInCents: Math.round(order.total * 100),
+        customerEmail: customerEmail!,
+        reference,
+        tokens,
+      });
+      const final = await awaitFinalStatus(created.id);
+      provider = "wompi";
+      providerRef = final.id;
+      if (final.status === "PENDING") {
+        throw new HttpError(504, "La pasarela aún no confirma el pago. Revisa Mis pagos en unos minutos antes de reintentar");
+      }
+      if (final.status !== "APPROVED") {
+        const detail = final.status_message ? ` (${final.status_message})` : "";
+        return decline(`Pasarela de pagos: ${final.status}${detail}`, provider, providerRef);
+      }
+    } else {
+      const reason = decide(order, method, cardLast4);
+      if (reason) return decline(reason);
     }
 
     const [payment] = await prisma.$transaction([
       prisma.payment.create({
-        data: { orderId, buyerId: user.id, amount: order.total, method, status: "AUTHORIZED", cardLast4: last4 },
+        data: { orderId, buyerId: user.id, amount: order.total, method, status: "AUTHORIZED", cardLast4: last4, provider, providerRef },
       }),
       ...settlementsFor(order.items).map((data) => prisma.settlement.create({ data: { ...data, orderId } })),
     ]);

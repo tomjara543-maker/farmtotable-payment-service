@@ -29,6 +29,8 @@ model Payment {
   status    PaymentStatus
   reason    String?
   cardLast4 String?       @map("card_last4")
+  provider    String?
+  providerRef String?     @map("provider_ref")
   createdAt DateTime      @default(now()) @map("created_at")
 
   @@index([orderId])
