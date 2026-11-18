@@ -56,10 +56,20 @@ const settlementJson = (s: Settlement, farmName?: string) => ({
   paidAt: s.paidAt ?? undefined,
 });
 
-function decide(order: Order, method: string, cardLast4?: string) {
+export function decide(order: Pick<Order, "total">, method: string, cardLast4?: string) {
   if (order.total > MAX_AUTHORIZED_AMOUNT) return "El monto supera el límite autorizado por la pasarela";
   if (method === "CARD" && cardLast4 === "0002") return "Fondos insuficientes (tarjeta de prueba rechazada)";
   return undefined;
+}
+
+export function settlementsFor(items: Pick<Order["items"][number], "producerId" | "quantity" | "unitPrice">[], rate = COMMISSION_RATE) {
+  const byProducer = new Map<string, number>();
+  for (const i of items) byProducer.set(i.producerId, (byProducer.get(i.producerId) ?? 0) + i.quantity * i.unitPrice);
+  return [...byProducer].map(([producerId, grossRaw]) => {
+    const gross = Math.round(grossRaw);
+    const commission = Math.round(gross * rate);
+    return { producerId, gross, commission, net: gross - commission };
+  });
 }
 
 export function paymentRoutes() {
@@ -86,18 +96,11 @@ export function paymentRoutes() {
       return res.status(402).json({ error: reason, payment: paymentJson(payment) });
     }
 
-    const byProducer = new Map<string, number>();
-    for (const i of order.items) byProducer.set(i.producerId, (byProducer.get(i.producerId) ?? 0) + i.quantity * i.unitPrice);
-
     const [payment] = await prisma.$transaction([
       prisma.payment.create({
         data: { orderId, buyerId: user.id, amount: order.total, method, status: "AUTHORIZED", cardLast4: last4 },
       }),
-      ...[...byProducer].map(([producerId, grossRaw]) => {
-        const gross = Math.round(grossRaw);
-        const commission = Math.round(gross * COMMISSION_RATE);
-        return prisma.settlement.create({ data: { producerId, orderId, gross, commission, net: gross - commission } });
-      }),
+      ...settlementsFor(order.items).map((data) => prisma.settlement.create({ data: { ...data, orderId } })),
     ]);
 
     publish("payment.authorized", {
